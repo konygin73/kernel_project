@@ -3,21 +3,21 @@
 #include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
-#include <linux/vmalloc.h>
-#include <linux/spinlock.h>
+#include <linux/vmalloc.h> /* Возвращен для vmalloc / vfree */
 #include <linux/sizes.h>
+#include <linux/rwsem.h> 
 
-/* 1 minor для самого диска + 3 minor для разделов = 4 */
-#define SIMPLE_BLKDEV_MINORS 4 
 #define PARTITION_COUNT      3
 #define PARTITION_SIZE_MB    100
+#define PARTITION_SIZE_BYTES ((size_t)PARTITION_SIZE_MB * SZ_1M)
+#define SIMPLE_BLKDEV_MINORS (PARTITION_COUNT + 1) 
 
 static int simple_blkdev_major;
 
 struct simple_blkdev_dev {
     struct gendisk *disk;
-    spinlock_t lock;
-    u8 *data;       /* Единый массив для всего диска (300 МиБ) */
+    struct rw_semaphore locks[PARTITION_COUNT];
+    u8 *data;       /* Единый массив для всего диска на vmalloc (300 МиБ) */
     size_t size;    /* Полный размер в байтах */
 };
 
@@ -32,35 +32,52 @@ static void simple_blkdev_release(struct gendisk *disk)
 {
 }
 
+static inline int get_interval_index(loff_t pos)
+{
+    int index = (int)(pos / PARTITION_SIZE_BYTES);
+    if (unlikely(index >= PARTITION_COUNT))
+        index = PARTITION_COUNT - 1;
+    return index;
+}
+
 static void simple_blkdev_submit_bio(struct bio *bio)
 {
     struct simple_blkdev_dev *dev = bio->bi_bdev->bd_disk->private_data;
     struct bio_vec bvec;
     struct bvec_iter iter;
+    bool is_write = (bio_data_dir(bio) == WRITE);
 
     bio_for_each_segment(bvec, bio, iter) {
-        /* Вычисляем позицию строго по итератору текущего сегмента */
         loff_t pos = iter.bi_sector * SECTOR_SIZE;
         size_t len = bvec.bv_len;
         void *buf;
+        int interval_idx;
 
-        /* Безопасность: проверка границ всего диска */
         if (unlikely(pos + len > dev->size)) {
             bio->bi_status = BLK_STS_IOERR;
             break;
         }
 
+        interval_idx = get_interval_index(pos);
+
+        if (is_write)
+            down_write(&dev->locks[interval_idx]);
+        else
+            down_read(&dev->locks[interval_idx]);
+
         buf = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
 
-        /* Благодаря прогреву vmalloc в init, здесь НЕ будет Page Fault */
-        spin_lock(&dev->lock);
-        if (bio_data_dir(bio) == WRITE)
+        if (is_write)
             memcpy(dev->data + pos, buf, len);
         else
             memcpy(buf, dev->data + pos, len);
-        spin_unlock(&dev->lock);
 
         kunmap_local(buf);
+
+        if (is_write)
+            up_write(&dev->locks[interval_idx]);
+        else
+            up_read(&dev->locks[interval_idx]);
     }
 
     bio_endio(bio);
@@ -76,23 +93,31 @@ static const struct block_device_operations simple_blkdev_fops = {
 static int __init simple_blkdev_init(void)
 {
     int ret;
-    size_t i;
+    size_t i; /* Переменная корректно объявлена */
+    int p;
 
-    /* Общий размер устройства: 3 раздела * 100 МиБ = 300 МиБ */
-    simple_blkdev.size = (size_t)PARTITION_COUNT * PARTITION_SIZE_MB * SZ_1M;
+    struct queue_limits lim = {
+        .logical_block_size = SECTOR_SIZE,
+        .physical_block_size = SECTOR_SIZE,
+        .io_min = SECTOR_SIZE,
+    };
+
+    simple_blkdev.size = (size_t)PARTITION_COUNT * PARTITION_SIZE_BYTES;
     
+    /* ВОЗВРАЩЕНО: Выделение виртуально непрерывной памяти ядра */
     simple_blkdev.data = vmalloc(simple_blkdev.size);
     if (!simple_blkdev.data)
         return -ENOMEM;
 
-    /* КРИТИЧЕСКИ ВАЖНО: Прогреваем память vmalloc, чтобы синхронизировать */
-    /* таблицы страниц ядра сейчас, а не внутри submit_bio под спин-локом! */
+    /* ОБЯЗАТЕЛЬНО: Принудительный прогрев страниц для vmalloc */
     for (i = 0; i < simple_blkdev.size; i += PAGE_SIZE) {
         volatile u8 *ptr = (volatile u8 *)(simple_blkdev.data + i);
         *ptr = 0;
     }
 
-    spin_lock_init(&simple_blkdev.lock);
+    for (p = 0; p < PARTITION_COUNT; p++) {
+        init_rwsem(&simple_blkdev.locks[p]);
+    }
 
     ret = register_blkdev(0, "simple_blkdev");
     if (ret < 0) {
@@ -101,7 +126,7 @@ static int __init simple_blkdev_init(void)
     }
     simple_blkdev_major = ret;
 
-    simple_blkdev.disk = blk_alloc_disk(NUMA_NO_NODE);
+    simple_blkdev.disk = blk_alloc_disk(&lim, NUMA_NO_NODE);
     if (IS_ERR(simple_blkdev.disk)) {
         ret = PTR_ERR(simple_blkdev.disk);
         goto err_unregister;
@@ -109,11 +134,7 @@ static int __init simple_blkdev_init(void)
 
     simple_blkdev.disk->major = simple_blkdev_major;
     simple_blkdev.disk->first_minor = 0;
-    
-    /* Задаем количество миноров (диск + разделы) */
     simple_blkdev.disk->minors = SIMPLE_BLKDEV_MINORS; 
-    
-    /* ВАЖНО: Удален флаг GENHD_FL_NO_PART, чтобы ядро разрешило разделы */
     simple_blkdev.disk->fops = &simple_blkdev_fops;
     simple_blkdev.disk->private_data = &simple_blkdev;
     
@@ -124,8 +145,7 @@ static int __init simple_blkdev_init(void)
     if (ret)
         goto err_cleanup_disk;
 
-    pr_info("simple_blkdev: registered, total capacity %llu sectors\n", 
-            get_capacity(simple_blkdev.disk));
+    pr_info("simple_blkdev: registered with vmalloc and interval rw-semaphores\n");
     return 0;
 
 err_cleanup_disk:
@@ -133,7 +153,7 @@ err_cleanup_disk:
 err_unregister:
     unregister_blkdev(simple_blkdev_major, "simple_blkdev");
 err_vfree:
-    vfree(simple_blkdev.data);
+    vfree(simple_blkdev.data); /* Заменено на корректный vfree */
     return ret;
 }
 
@@ -142,7 +162,7 @@ static void __exit simple_blkdev_exit(void)
     del_gendisk(simple_blkdev.disk);
     put_disk(simple_blkdev.disk);
     unregister_blkdev(simple_blkdev_major, "simple_blkdev");
-    vfree(simple_blkdev.data);
+    vfree(simple_blkdev.data); /* Заменено на корректный vfree */
     pr_info("simple_blkdev: unloaded\n");
 }
 
@@ -151,4 +171,4 @@ module_exit(simple_blkdev_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("otus-lession demo");
-MODULE_DESCRIPTION("RAM-backed block device with partition support");
+MODULE_DESCRIPTION("RAM block device with vmalloc and interval RW locks");
