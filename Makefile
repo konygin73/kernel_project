@@ -1,7 +1,7 @@
 PWD := $(shell pwd)
 KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 
-DRV_NAME := kernel_ram_dsk
+DRV_NAME := simple_blkdev
 
 #CLANG_FORMAT_VERS ?= 14
 #CLANG_FORMAT := clang-format-$(CLANG_FORMAT_VERS)
