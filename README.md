@@ -4,7 +4,9 @@
 # 1. Компиляция модуля
 make
 
-# 2. Загрузка в ядро
+# 2. Тестовый скрипт check.sh
+
+# 3. Загрузка в ядро
 sudo insmod simple_blkdev.ko
 sudo dmesg | tail -n 5
 # simple_blkdev: module loaded securely. Registered device: /dev/simple_blkdev0
