@@ -1,48 +1,66 @@
 #!/bin/bash
 
-# Проверяем, запущен ли скрипт от root
 if [ "$EUID" -ne 0 ]; then
   echo "❌ Пожалуйста, запустите скрипт с правами sudo"
   exit 1
 fi
 
-# Загрузка модуля: kmem_cache, таймер каждые 2 секунды
-insmod kernel_msgpool.ko alloc_type=0 interval_ms=2000
+echo "🔄 Загрузка модуля..."
+insmod simple_blkdev.ko || { echo "❌ Ошибка загрузки модуля"; exit 1; }
 
-# Отправка нескольких сообщений
-echo "message one"   > /sys/module/kernel_msgpool/parameters/send
-echo "message two"   > /sys/module/kernel_msgpool/parameters/send
-echo "message three" > /sys/module/kernel_msgpool/parameters/send
+echo "🔄 Разметка диска (GPT, 3 раздела)..."
+parted -s /dev/simple_blkdev0 mklabel gpt
+parted -s /dev/simple_blkdev0 mkpart primary ext4 1MiB 100MiB
+parted -s /dev/simple_blkdev0 mkpart primary ext4 100MiB 200MiB
+parted -s /dev/simple_blkdev0 mkpart primary ext4 200MiB 100%
 
-# Через 2 секунды таймер сработает — в dmesg:
-# msgpool: message one   (queued 2001345000 ns ago)
-# msgpool: [^1] message two   (queued 2001100000 ns ago)
-# msgpool: [^2] message three (queued 2000800000 ns ago)
+echo "🔄 Перечитывание таблицы разделов..."
+blockdev --rereadpt /dev/simple_blkdev0
+sleep 1 # Небольшая пауза для гарантии применения изменений ядром
 
-# Прочитать последнее обработанное сообщение
-cat /sys/module/kernel_msgpool/parameters/inbox
-# message three
+echo "🔄 Форматирование разделов..."
+mkfs.ext4 -F /dev/simple_blkdev0p1
+mkfs.ext4 -F /dev/simple_blkdev0p2
+mkfs.ext4 -F /dev/simple_blkdev0p3
 
-# Статистика
-cat /sys/module/kernel_msgpool/parameters/stats
-# sent=3 consumed=3 flushed=0 dropped=0 queued=0 alloc=kmem_cache interval_ms=2000
+echo "🔄 Монтирование..."
+mkdir -p /mnt/ram_p1 /mnt/ram_p2 /mnt/ram_p3
+mount /dev/simple_blkdev0p1 /mnt/ram_p1
+mount /dev/simple_blkdev0p2 /mnt/ram_p2
+mount /dev/simple_blkdev0p3 /mnt/ram_p3
 
-sleep 3
+echo "📊 Структура разделов:"
+lsblk | grep simple_blkdev
 
-cat /sys/module/kernel_msgpool/parameters/inbox
+echo "📊 Статистика ДО записи:"
+cat /sys/block/simple_blkdev0/stat_bytes_read
+cat /sys/block/simple_blkdev0/stat_bytes_written
 
-cat /sys/module/kernel_msgpool/parameters/stats
+echo "📝 Копирование тестового файла и синхронизация..."
+# Создаем тестовый файл, если его нет
+if [ ! -f ./check.sh ]; then
+    echo "echo 'test'" > ./check.sh
+    chmod +x ./check.sh
+fi
+cp ./check.sh /mnt/ram_p1/
+sync # Принудительная запись всех кэшей на диск (вызовет REQ_OP_FLUSH)
 
-# Переключиться на mempool
-echo 1 > /sys/module/kernel_msgpool/parameters/alloc_type
+echo "📊 Статистика ПОСЛЕ записи:"
+cat /sys/block/simple_blkdev0/stat_bytes_read
+cat /sys/block/simple_blkdev0/stat_bytes_written
 
-echo "mempool message" > /sys/module/kernel_msgpool/parameters/send
+echo "🔄 Очистка и выгрузка..."
+# 1. Отмонтирование
+umount /mnt/ram_p1 /mnt/ram_p2 /mnt/ram_p3
 
-# Принудительный сброс (освободить не обработанные сообщения)
-echo 1 > /sys/module/kernel_msgpool/parameters/flush
+# 2. Принудительный сброс буферов блочного устройства (критично перед удалением!)
+blockdev --flushbufs /dev/simple_blkdev0
 
-# Изменить период таймера
-echo 500 > /sys/module/kernel_msgpool/parameters/interval_ms
+# 3. Удаление таблиц разделов из ядра (игнорируем ошибки, если уже удалены)
+partx -d /dev/simple_blkdev0 2>/dev/null || true
 
-# Выгрузка
-sudo rmmod kernel_msgpool
+# 4. Выгрузка модуля
+rmmod simple_blkdev
+
+echo "✅ Готово. Последние сообщения ядра:"
+dmesg | tail -n 15

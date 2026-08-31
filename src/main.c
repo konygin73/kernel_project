@@ -13,7 +13,7 @@
 
 #define SIMPLE_BLKDEV_MINORS      1
 #define SIMPLE_BLKDEV_SIZE_MB     300
-#define PAGES_PER_CHUNK           512  /* 512 × 8 = PAGE_SIZE для указателей */
+#define PAGES_PER_CHUNK           512  /* 512 × 8 = PAGE_SIZE */
 
 static unsigned int simple_blkdev_size_mb = SIMPLE_BLKDEV_SIZE_MB;
 module_param(simple_blkdev_size_mb, uint, 0444);
@@ -23,9 +23,10 @@ static int simple_blkdev_major;
 
 struct simple_blkdev_dev {
     struct gendisk   *disk;
-    struct page    ***chunks;
+    struct page    ***chunks;//[150][512][4096]
     size_t            num_chunks;
     size_t            num_pages;
+    size_t            num_sectors;
     size_t            size;
     rwlock_t          lock;
 
@@ -35,12 +36,6 @@ struct simple_blkdev_dev {
 };
 
 static struct simple_blkdev_dev simple_blkdev;
-
-static inline struct page *dev_get_page(struct simple_blkdev_dev *dev,
-                                        pgoff_t idx)
-{
-    return dev->chunks[idx / PAGES_PER_CHUNK][idx % PAGES_PER_CHUNK];
-}
 
 static int simple_blkdev_open(struct gendisk *disk, blk_mode_t mode)
 {
@@ -60,14 +55,44 @@ static void simple_blkdev_submit_bio(struct bio *bio)
     unsigned int op = bio_op(bio);
     size_t total_bytes_processed = 0;
 
-    /* Гарантированная проверка границ всего BIO на старте */
-    if (unlikely((bio->bi_iter.bi_sector + bio_sectors(bio)) * SECTOR_SIZE > dev->size)) {
-        bio->bi_status = BLK_STS_IOERR;
+    if (op == REQ_OP_FLUSH || op == REQ_OP_DISCARD) {
         bio_endio(bio);
         return;
     }
 
-    if (op == REQ_OP_FLUSH || op == REQ_OP_DISCARD) {
+    if (unlikely(bio->bi_iter.bi_sector + bio_sectors(bio) > dev->num_sectors)) {
+        bio->bi_status = BLK_STS_IOERR;
+        bio_endio(bio);
+        pr_err("Out of size\n");
+        return;
+    }
+
+    if (op == REQ_OP_WRITE_ZEROES) {
+        sector_t sector = bio->bi_iter.bi_sector;
+        unsigned int nr_sectors = bio_sectors(bio);
+        loff_t pos = sector * SECTOR_SIZE;
+        size_t len = nr_sectors * SECTOR_SIZE;
+        size_t offset = 0;
+
+        write_lock_irqsave(&dev->lock, flags);
+        while (offset < len) {
+            pgoff_t page_idx = (pos + offset) / PAGE_SIZE;
+            size_t page_off  = (pos + offset) % PAGE_SIZE;
+            size_t chunk_len = min_t(size_t, len - offset, PAGE_SIZE - page_off);
+
+            size_t chunk_n = page_idx / PAGES_PER_CHUNK;
+            size_t page_n = page_idx % PAGES_PER_CHUNK;
+
+            struct page *c_page = dev->chunks[chunk_n][page_n];
+            void *dst = kmap_local_page(c_page) + page_off;
+
+            memset(dst, 0, chunk_len);
+
+            kunmap_local(dst);
+            offset += chunk_len;
+        }
+        write_unlock_irqrestore(&dev->lock, flags);
+
         bio_endio(bio);
         return;
     }
@@ -80,31 +105,46 @@ static void simple_blkdev_submit_bio(struct bio *bio)
         read_lock_irqsave(&dev->lock, flags);
 
     bio_for_each_segment(bvec, bio, iter) {
-        void *src = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
-        size_t len = bvec.bv_len;
+        void *bvec_src = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
+        size_t need_len = bvec.bv_len;
+        size_t completed = 0;
+
+        /* Вычисляем глобальную позицию в байтах для текущего сегмента */
         loff_t pos = iter.bi_sector * SECTOR_SIZE;
-        size_t offset = 0;
 
-        while (offset < len) {
-            pgoff_t page_idx = (pos + offset) / PAGE_SIZE;
-            size_t page_off  = (pos + offset) % PAGE_SIZE;
-            size_t chunk_len = min_t(size_t, len - offset, PAGE_SIZE - page_off);
+        while (completed < need_len) {
+            /* Пересчитываем индексы на каждом шагу с учетом смещения completed */
+            pgoff_t page_idx = (pos + completed) / PAGE_SIZE;
+            size_t page_off  = (pos + completed) % PAGE_SIZE;
 
-            void *dst = kmap_local_page(dev_get_page(dev, page_idx)) + page_off;
+            /* Защита от выхода за границы внутри сегмента */
+            if (unlikely(page_idx >= dev->num_pages)) {
+                bio->bi_status = BLK_STS_IOERR;
+                break;
+            }
 
+            size_t chunk_n = page_idx / PAGES_PER_CHUNK;
+            size_t page_n = page_idx % PAGES_PER_CHUNK;
+
+            /* Вычисляем безопасную длину: не больше остатка сегмента и не дальше конца текущей страницы */
+            size_t chunk_len = min_t(size_t, need_len - completed, PAGE_SIZE - page_off);
+            
+            struct page *c_page = dev->chunks[chunk_n][page_n];
+            void *dst = kmap_local_page(c_page) + page_off;
+        
             if (is_write)
-                memcpy(dst, src + offset, chunk_len);
+                memcpy(dst, bvec_src + completed, chunk_len);
             else
-                memcpy(src + offset, dst, chunk_len);
+                memcpy(bvec_src + completed, dst, chunk_len);
 
             kunmap_local(dst);
-            offset += chunk_len;
+
+            completed += chunk_len;
             total_bytes_processed += chunk_len;
         }
-        kunmap_local(src);
+        kunmap_local(bvec_src);
     }
 
-    /* Освобождаем блокировку и инкрементируем атомики за пределами критической секции */
     if (is_write) {
         write_unlock_irqrestore(&dev->lock, flags);
         atomic64_add(total_bytes_processed, &dev->bytes_written);
@@ -132,8 +172,6 @@ static ssize_t stat_bytes_read_show(struct device *dev,
 {
     struct gendisk *disk = dev_to_disk(dev);
     struct simple_blkdev_dev *sdev = disk->private_data;
-
-    /* Атомарное чтение не требует захвата тяжелого rwlock диска */
     return sysfs_emit(buf, "%lld\n", atomic64_read(&sdev->bytes_read));
 }
 
@@ -142,7 +180,6 @@ static ssize_t stat_bytes_written_show(struct device *dev,
 {
     struct gendisk *disk = dev_to_disk(dev);
     struct simple_blkdev_dev *sdev = disk->private_data;
-
     return sysfs_emit(buf, "%lld\n", atomic64_read(&sdev->bytes_written));
 }
 
@@ -158,6 +195,7 @@ static struct attribute *simple_blkdev_attrs[] = {
 static const struct attribute_group simple_blkdev_attr_group = {
     .attrs = simple_blkdev_attrs,
 };
+
 /* ------------------------------------------------------------------ */
 
 static void simple_blkdev_free_all(void)
@@ -172,7 +210,8 @@ static void simple_blkdev_free_all(void)
             continue;
 
         size_t pages_in_chunk = min_t(size_t, PAGES_PER_CHUNK,
-                                      simple_blkdev.num_pages - i * PAGES_PER_CHUNK);
+                              simple_blkdev.num_pages - i * PAGES_PER_CHUNK);
+
         for (j = 0; j < pages_in_chunk; j++) {
             if (simple_blkdev.chunks[i][j])
                 __free_page(simple_blkdev.chunks[i][j]);
@@ -199,14 +238,13 @@ static int __init simple_blkdev_init(void)
         return -EINVAL;
     }
 
-    /* Инициализация атомарных счетчиков */
     atomic64_set(&simple_blkdev.bytes_read, 0);
     atomic64_set(&simple_blkdev.bytes_written, 0);
 
     simple_blkdev.size       = (size_t)simple_blkdev_size_mb * SZ_1M;
     simple_blkdev.num_pages  = simple_blkdev.size / PAGE_SIZE;
-    simple_blkdev.num_chunks = DIV_ROUND_UP(simple_blkdev.num_pages,
-                                            PAGES_PER_CHUNK);
+    simple_blkdev.num_chunks = DIV_ROUND_UP(simple_blkdev.num_pages, PAGES_PER_CHUNK);
+    simple_blkdev.num_sectors = simple_blkdev.size / SECTOR_SIZE;
 
     pr_info("allocating static %u MiB: %zu pages in %zu chunks\n",
             simple_blkdev_size_mb,
@@ -221,17 +259,15 @@ static int __init simple_blkdev_init(void)
         return -ENOMEM;
     }
 
-    /* Полное статическое выделение всех страниц при старте */
     for (i = 0; i < simple_blkdev.num_chunks; i++) {
-        size_t pages_in_chunk = min_t(size_t, PAGES_PER_CHUNK,
-                                      simple_blkdev.num_pages - i * PAGES_PER_CHUNK);
+        size_t pages_in_chunk = min_t(size_t, PAGES_PER_CHUNK, simple_blkdev.num_pages - i * PAGES_PER_CHUNK);
 
         simple_blkdev.chunks[i] = kcalloc(pages_in_chunk,
                                           sizeof(struct page *),
                                           GFP_KERNEL);
         if (!simple_blkdev.chunks[i]) {
-            pr_err("failed to allocate chunk[%zu]\n", i);
             ret = -ENOMEM;
+            pr_err("failed to allocate chunk[%zu]\n", i);
             goto err_free;
         }
 
@@ -278,7 +314,6 @@ static int __init simple_blkdev_init(void)
         goto err_cleanup_disk;
     }
 
-    /* Создаем sysfs файлы в директории устройства */
     ret = sysfs_create_group(&disk_to_dev(simple_blkdev.disk)->kobj,
                              &simple_blkdev_attr_group);
     if (ret) {
@@ -286,7 +321,7 @@ static int __init simple_blkdev_init(void)
         goto err_del_disk;
     }
 
-    pr_info("registered /dev/simple_blkdev0: %u MiB (stat: atomic64_t)\n", simple_blkdev_size_mb);
+    pr_info("registered /dev/simple_blkdev0: %u MiB\n", simple_blkdev_size_mb);
     return 0;
 
 err_del_disk:
@@ -304,18 +339,16 @@ static void __exit simple_blkdev_exit(void)
 {
     sysfs_remove_group(&disk_to_dev(simple_blkdev.disk)->kobj,
                        &simple_blkdev_attr_group);
-
     del_gendisk(simple_blkdev.disk);
     put_disk(simple_blkdev.disk);
     unregister_blkdev(simple_blkdev_major, "simple_blkdev");
-
     simple_blkdev_free_all();
-
     pr_info("unloaded\n");
 }
 
 module_init(simple_blkdev_init);
 module_exit(simple_blkdev_exit);
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("konygin");
 MODULE_DESCRIPTION("RAM block device 300 MiB with atomic64 stats and without reclaim");

@@ -38,6 +38,11 @@ lsblk | grep simple_blkdev
 cat /sys/block/simple_blkdev0/stat_bytes_read
 cat /sys/block/simple_blkdev0/stat_bytes_written
 
+# тестовое копирование произвольного файла
+cp ./check.sh /mnt/ram_p1
+# отправить данные из системного кэша страниц вниз, в драйвер
+sync
+
 # Удаления (выгрузки) блочного драйвера
 # 1. Отмонтирование файловых систем
 sudo umount /mnt/ram_p1
@@ -53,5 +58,5 @@ sudo partx -d /dev/simple_blkdev0
 # 3. Выгрузка модуля драйвера из ядра
 sudo rmmod simple_blkdev
 
-sudo dmesg | tail -n 5
+sudo dmesg | tail -n 10
 # simple_blkdev: module unloaded successfully
