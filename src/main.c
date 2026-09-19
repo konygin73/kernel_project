@@ -11,9 +11,11 @@
 #include <linux/sysfs.h>
 #include <linux/atomic.h>
 
-#define SIMPLE_BLKDEV_MINORS      1
-#define SIMPLE_BLKDEV_SIZE_MB     300
-#define PAGES_PER_CHUNK           512  /* 512 × 8 = PAGE_SIZE */
+#define SIMPLE_BLKDEV_MINORS            1
+#define SIMPLE_BLKDEV_SIZE_MB           300  /* размер диска */
+#define PAGES_PER_CHUNK                 512  /* 512 × 8 = PAGE_SIZE (4096) */
+#define SIMPLE_BLKDEV_NAME              "simple_blkdev"
+#define SIMPLE_BLKDEV_FIRST_DISK_INDEX  0
 
 static unsigned int simple_blkdev_size_mb = SIMPLE_BLKDEV_SIZE_MB;
 module_param(simple_blkdev_size_mb, uint, 0444);
@@ -23,11 +25,12 @@ static int simple_blkdev_major;
 
 struct simple_blkdev_dev {
     struct gendisk   *disk;
-    struct page    ***chunks;//[150][512][4096]
-    size_t            num_chunks;
-    size_t            num_pages;
-    size_t            num_sectors;
-    size_t            size;
+    /* 150 чанков по 512 указателей на страницы памяти по 4096 байт */
+    struct page    ***chunks;// [150][512]=alloc_page[4096]
+    size_t            num_chunks;// 76800 / 512 = 150
+    size_t            num_pages;// 300 × 1024 × 1024 / 4096 = 76800 - количество страниц
+    size_t            num_sectors;// 300 × 1024 × 1024 / 512 = 614400 - количество секторов
+    size_t            size;// 300 MiB - размер диска
     rwlock_t          lock;
 
     /* счетчики для sysfs статистики */
@@ -46,6 +49,7 @@ static void simple_blkdev_release(struct gendisk *disk)
 {
 }
 
+// atomic context
 static void simple_blkdev_submit_bio(struct bio *bio)
 {
     struct simple_blkdev_dev *dev = bio->bi_bdev->bd_disk->private_data;
@@ -55,11 +59,13 @@ static void simple_blkdev_submit_bio(struct bio *bio)
     unsigned int op = bio_op(bio);
     size_t total_bytes_processed = 0;
 
+    // не обрабатываем сброс кэша и удаление (DISCARD) для RAM-диска
     if (op == REQ_OP_FLUSH || op == REQ_OP_DISCARD) {
         bio_endio(bio);
         return;
     }
 
+    // начальный сектор + количество секторов = контроль границ
     if (unlikely(bio->bi_iter.bi_sector + bio_sectors(bio) > dev->num_sectors)) {
         bio->bi_status = BLK_STS_IOERR;
         bio_endio(bio);
@@ -67,6 +73,7 @@ static void simple_blkdev_submit_bio(struct bio *bio)
         return;
     }
 
+    // обнулить диапазон
     if (op == REQ_OP_WRITE_ZEROES) {
         sector_t sector = bio->bi_iter.bi_sector;
         unsigned int nr_sectors = bio_sectors(bio);
@@ -122,14 +129,15 @@ static void simple_blkdev_submit_bio(struct bio *bio)
                 bio->bi_status = BLK_STS_IOERR;
                 break;
             }
-
+            // номер чанка
             size_t chunk_n = page_idx / PAGES_PER_CHUNK;
+            // позиция указателя на страницу в чанке
             size_t page_n = page_idx % PAGES_PER_CHUNK;
-
-            /* Вычисляем безопасную длину: не больше остатка сегмента и не дальше конца текущей страницы */
+            // длина: не больше остатка сегмента и не дальше конца текущей страницы
             size_t chunk_len = min_t(size_t, need_len - completed, PAGE_SIZE - page_off);
             
             struct page *c_page = dev->chunks[chunk_n][page_n];
+            // указатель на память из struct page*
             void *dst = kmap_local_page(c_page) + page_off;
         
             if (is_write)
@@ -166,7 +174,6 @@ static const struct block_device_operations simple_blkdev_fops = {
 /* ------------------------------------------------------------------ */
 /* РЕАЛИЗАЦИЯ ИНТЕРФЕЙСА SYSFS                                        */
 /* ------------------------------------------------------------------ */
-
 static ssize_t stat_bytes_read_show(struct device *dev,
                                     struct device_attribute *attr, char *buf)
 {
@@ -192,6 +199,7 @@ static struct attribute *simple_blkdev_attrs[] = {
     NULL,
 };
 
+// для sysfs_create_group
 static const struct attribute_group simple_blkdev_attr_group = {
     .attrs = simple_blkdev_attrs,
 };
@@ -229,8 +237,8 @@ static int __init simple_blkdev_init(void)
     struct queue_limits lim = {
         .logical_block_size  = SECTOR_SIZE,
         .physical_block_size = SECTOR_SIZE,
-        .max_segment_size    = PAGE_SIZE,
-        .max_sectors         = BLK_SAFE_MAX_SECTORS,
+        .max_segment_size    = PAGE_SIZE,// bv_offset + bv_len ≤ PAGE_SIZE
+        .max_sectors         = BLK_SAFE_MAX_SECTORS,//1.25 MiB
     };
 
     if (!simple_blkdev_size_mb) {
@@ -241,10 +249,10 @@ static int __init simple_blkdev_init(void)
     atomic64_set(&simple_blkdev.bytes_read, 0);
     atomic64_set(&simple_blkdev.bytes_written, 0);
 
-    simple_blkdev.size       = (size_t)simple_blkdev_size_mb * SZ_1M;
-    simple_blkdev.num_pages  = simple_blkdev.size / PAGE_SIZE;
-    simple_blkdev.num_chunks = DIV_ROUND_UP(simple_blkdev.num_pages, PAGES_PER_CHUNK);
-    simple_blkdev.num_sectors = simple_blkdev.size / SECTOR_SIZE;
+    simple_blkdev.size       = (size_t)simple_blkdev_size_mb * SZ_1M;// 300 MiB - размер диска
+    simple_blkdev.num_pages  = simple_blkdev.size / PAGE_SIZE;// 300 × 1024 × 1024 / 4096 = 76800 страниц
+    simple_blkdev.num_chunks = DIV_ROUND_UP(simple_blkdev.num_pages, PAGES_PER_CHUNK);// 76800 / 512 = 150
+    simple_blkdev.num_sectors = simple_blkdev.size / SECTOR_SIZE;// 300 × 1024 × 1024 / 512 = 614400 секторов
 
     pr_info("allocating static %u MiB: %zu pages in %zu chunks\n",
             simple_blkdev_size_mb,
@@ -272,6 +280,8 @@ static int __init simple_blkdev_init(void)
         }
 
         for (j = 0; j < pages_in_chunk; j++) {
+            // 4096 байт (одна страница)
+            // запись остаётся в page table навсегда без выгрузки в swap
             simple_blkdev.chunks[i][j] = alloc_page(GFP_KERNEL | __GFP_ZERO);
             if (!simple_blkdev.chunks[i][j]) {
                 pr_err("failed to allocate page[%zu][%zu]\n", i, j);
@@ -283,7 +293,7 @@ static int __init simple_blkdev_init(void)
 
     rwlock_init(&simple_blkdev.lock);
 
-    ret = register_blkdev(0, "simple_blkdev");
+    ret = register_blkdev(0, SIMPLE_BLKDEV_NAME);
     if (ret < 0) {
         pr_err("register_blkdev failed: %d\n", ret);
         goto err_free;
@@ -297,15 +307,17 @@ static int __init simple_blkdev_init(void)
     }
 
     simple_blkdev.disk->major        = simple_blkdev_major;
-    simple_blkdev.disk->first_minor  = 0;
+    simple_blkdev.disk->first_minor  = SIMPLE_BLKDEV_FIRST_DISK_INDEX;
     simple_blkdev.disk->minors       = SIMPLE_BLKDEV_MINORS;
     simple_blkdev.disk->fops         = &simple_blkdev_fops;
     simple_blkdev.disk->private_data = &simple_blkdev;
+    //simple_blkdev.disk->flags инициализируется по умолчанию
 
     snprintf(simple_blkdev.disk->disk_name,
              sizeof(simple_blkdev.disk->disk_name),
-             "simple_blkdev%d", 0);
+             "%s%d", SIMPLE_BLKDEV_NAME, SIMPLE_BLKDEV_FIRST_DISK_INDEX);
 
+    // размера блочного устройства в секторах
     set_capacity(simple_blkdev.disk, simple_blkdev.size / SECTOR_SIZE);
 
     ret = add_disk(simple_blkdev.disk);
@@ -314,6 +326,7 @@ static int __init simple_blkdev_init(void)
         goto err_cleanup_disk;
     }
 
+    // disk_to_dev - возвращает device для "нулевого раздела" (весь диск)
     ret = sysfs_create_group(&disk_to_dev(simple_blkdev.disk)->kobj,
                              &simple_blkdev_attr_group);
     if (ret) {
@@ -325,11 +338,16 @@ static int __init simple_blkdev_init(void)
     return 0;
 
 err_del_disk:
+    // удаляет блочное устройство из системы — убирает его из /sys/block/, 
+    // не освобождает память
     del_gendisk(simple_blkdev.disk);
 err_cleanup_disk:
+    // уменьшает счётчик ссылок на struct gendisk и, если счётчик достигает нуля, 
+    // освобождает память, занятую диском
     put_disk(simple_blkdev.disk);
 err_unregister:
-    unregister_blkdev(simple_blkdev_major, "simple_blkdev");
+    // освобождение major номера
+    unregister_blkdev(simple_blkdev_major, SIMPLE_BLKDEV_NAME);
 err_free:
     simple_blkdev_free_all();
     return ret;
@@ -341,7 +359,7 @@ static void __exit simple_blkdev_exit(void)
                        &simple_blkdev_attr_group);
     del_gendisk(simple_blkdev.disk);
     put_disk(simple_blkdev.disk);
-    unregister_blkdev(simple_blkdev_major, "simple_blkdev");
+    unregister_blkdev(simple_blkdev_major, SIMPLE_BLKDEV_NAME);
     simple_blkdev_free_all();
     pr_info("unloaded\n");
 }

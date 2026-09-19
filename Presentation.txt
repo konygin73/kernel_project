@@ -1,0 +1,112 @@
+1)
+Реализовать драйвер блочного устройства размером в 300 MiB по умолчанию с поддержкой максимум трёх разделов с функциями read, write.
+Разметка разделов ("parted"), форматирование разделов (mkfs.ext4), монтирование разделов (mount) выполняется пользователем.
+Реализовать интерфейс /sysfs, позволяющий получить количество прочитанных и записанных данных.
+
+Курс: Разработка ядра Linux
+
+2)
+Автор: Коныгин Александр Владимирович
+Разработчик C/C++ (больше C++) Windows, Linux (более 10 лет)
+
+3)
+Цель: Реализовать драйвер блочного устройства в 300 MiB, который при регистрации будет видеться 
+системой как /sys/block/simple_blkdev0 и позволит пользователю разбить на 3 раздела (максимум), отформатировать 
+и смонтировать, получить три точки монтирования на одном RAM-диске 300 MiB.
+Реализовать интерфейс /sysfs, позволяющий получить статистику: количество прочитанных и записанных данных.
+Написать командный файл тестирования.
+
+Технологии: использовано bio-based API (.submit_bio), где драйвер напрямую обрабатывает запросы ввода-вывода 
+без реализации очереди (blk-mq queue_rq).
+
+Что получилось: 
+- Регистрация блочного устройства /sys/block/simple_blkdev0 -> /dev/simple_blkdev0
+- Разметка диска на 3 раздела средствами parted
+- Форматирование разделов
+- Монтирование разделов
+- Копирование файла
+- Чтение статистики
+
+Выводы:
+- Создано рабочее блочное устройство.
+- Получена статистика.
+
+Рекомендации:
+- Синхронизация для меньших блоков:
+   реализовать sharded locks — разделение диска на несколько шардов, 
+   каждый со своим rwlock, для увеличения параллелизма при одновременных 
+   операциях чтения/записи в разные части диска.
+
+Блок инициализации:
+Для реализации RAM диска используем alloc_page(GFP_KERNEL | __GFP_ZERO), что сразу выделяет память (не ленивое выделение)
+и гарантирует, что каждая страница физически непрерывна и не вызывает page fault при обращении в atomic context 
+(функция simple_blkdev_submit_bio работает в atomic context, где page fault вызовет kernel panic).
+
+Для хранения 300 МиБ данных необходимо 76 800 страниц (300 МиБ / 4 КБ).
+Массив из 76 800 указателей на struct page потребовал бы 614 400 байт,
+что превышает размер одной страницы (4 КБ).
+
+Решение: используем двумерный массив "struct page ***chunks":
+- 150 чанков (первый уровень)
+- Каждый чанк содержит до 512 указателей на struct page (второй уровень)
+- Каждый указатель ссылается на физическую страницу размером 4 КБ
+
+Это позволяет выделить массив указателей через kcalloc (slab allocator),
+где каждая аллокация не превышает PAGE_SIZE, что гарантирует 100% успех
+даже при фрагментации памяти.
+
+Динамическое выделение major: register_blkdev(0, SIMPLE_BLKDEV_NAME).
+Аллокация структуры диска blk_alloc_disk(&lim, NUMA_NO_NODE) для bio-based драйвера.
+Появление устройства: add_disk(simple_blkdev.disk) sys/block/simple_blkdev0.
+Добавляем группу атрибутов в sysfs: sysfs_create_group.
+
+Обработка запросов: simple_blkdev_submit_bio
+Обрабатываем как успешные op == REQ_OP_FLUSH || op == REQ_OP_DISCARD сброс кэша и удаление.
+Контроль выхода за пределы диска: bio->bi_iter.bi_sector + bio_sectors(bio) > dev->num_sectors.
+Обнуление диапазона: op == REQ_OP_WRITE_ZEROES.
+Синхронизация для читателя-писателя rwlock: read_lock_irqsave и write_lock_irqsave.
+Итерация по bio: bio_for_each_segment(bvec, bio, iter).
+
+kmap_local_page(bvec.bv_page) — мапит физическую страницу источника 
+в виртуальное адресное пространство ядра и возвращает виртуальный адрес 
+для доступа к данным.
+
+Для RAM-диска: вычисляем индекс страницы (page_idx) и смещение (page_off) по позиции bio, 
+затем kmap_local_page(c_page) мапит нужную страницу диска.
+
+Копирование данных memcpy.
+Размапирование kunmap_local адреса назначения и адреса источника.
+Разблокирование для читателя и писателя соответственно read_unlock_irqrestore и 
+write_unlock_irqrestore.
+Подсчет статистики atomic64_add для bytes_read и bytes_written соответственно.
+
+Пример запуска и генерации статистики в check.sh:
+insmod simple_blkdev.ko
+
+parted -s /dev/simple_blkdev0 mklabel gpt
+parted -s /dev/simple_blkdev0 mkpart primary ext4 1MiB 100MiB
+parted -s /dev/simple_blkdev0 mkpart primary ext4 100MiB 200MiB
+parted -s /dev/simple_blkdev0 mkpart primary ext4 200MiB 100%
+
+blockdev --rereadpt /dev/simple_blkdev0
+
+mkfs.ext4 -F /dev/simple_blkdev0p1
+mkfs.ext4 -F /dev/simple_blkdev0p2
+mkfs.ext4 -F /dev/simple_blkdev0p3
+
+mkdir -p /mnt/ram_p1 /mnt/ram_p2 /mnt/ram_p3
+mount /dev/simple_blkdev0p1 /mnt/ram_p1
+mount /dev/simple_blkdev0p2 /mnt/ram_p2
+mount /dev/simple_blkdev0p3 /mnt/ram_p3
+
+# Чтение статистики
+cat /sys/block/simple_blkdev0/stat_bytes_read
+cat /sys/block/simple_blkdev0/stat_bytes_written
+
+# Тестовая запись
+cp ./check.sh /mnt/ram_p1
+sync
+
+# Статистика после записи
+cat /sys/block/simple_blkdev0/stat_bytes_read
+cat /sys/block/simple_blkdev0/stat_bytes_written
