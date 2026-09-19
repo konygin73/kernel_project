@@ -10,10 +10,10 @@
 #include <linux/spinlock.h>
 #include <linux/sysfs.h>
 #include <linux/atomic.h>
+#include <linux/vmalloc.h>
 
 #define SIMPLE_BLKDEV_MINORS            1
-#define SIMPLE_BLKDEV_SIZE_MB           300  /* размер диска */
-#define PAGES_PER_CHUNK                 512  /* 512 × 8 = PAGE_SIZE (4096) */
+#define SIMPLE_BLKDEV_SIZE_MB           300
 #define SIMPLE_BLKDEV_NAME              "simple_blkdev"
 #define SIMPLE_BLKDEV_FIRST_DISK_INDEX  0
 
@@ -25,15 +25,11 @@ static int simple_blkdev_major;
 
 struct simple_blkdev_dev {
     struct gendisk   *disk;
-    /* 150 чанков по 512 указателей на страницы памяти по 4096 байт */
-    struct page    ***chunks;// [150][512]=alloc_page[4096]
-    size_t            num_chunks;// 76800 / 512 = 150
-    size_t            num_pages;// 300 × 1024 × 1024 / 4096 = 76800 - количество страниц
-    size_t            num_sectors;// 300 × 1024 × 1024 / 512 = 614400 - количество секторов
-    size_t            size;// 300 MiB - размер диска
+    void             *data;         /* vmalloc-буфер — весь диск одним блоком */
+    size_t            size;         /* размер диска в байтах */
+    size_t            num_sectors;  /* размер диска в секторах */
     rwlock_t          lock;
-
-    /* счетчики для sysfs статистики */
+    /* Счётчики для sysfs-статистики */
     atomic64_t        bytes_read;
     atomic64_t        bytes_written;
 };
@@ -49,7 +45,17 @@ static void simple_blkdev_release(struct gendisk *disk)
 {
 }
 
-// atomic context
+/*
+ * Обработчик bio-запросов.
+ *
+ * Работает в atomic context (прерывание/softirq):
+ * - Нельзя спать (schedule, GFP_KERNEL и т.п.)
+ * - Нельзя обращаться к памяти, которая может вызвать page fault
+ * vmalloc-память безопасна здесь, так как:
+ * - Выделена заранее в simple_blkdev_init()
+ * - PTE (Page Table Entries) уже установлены
+ * - TLB miss приведёт к аппаратному page table walk без сна
+ */
 static void simple_blkdev_submit_bio(struct bio *bio)
 {
     struct simple_blkdev_dev *dev = bio->bi_bdev->bd_disk->private_data;
@@ -59,13 +65,13 @@ static void simple_blkdev_submit_bio(struct bio *bio)
     unsigned int op = bio_op(bio);
     size_t total_bytes_processed = 0;
 
-    // не обрабатываем сброс кэша и удаление (DISCARD) для RAM-диска
+    /* 1. Команды без данных — завершаем как успешные */
     if (op == REQ_OP_FLUSH || op == REQ_OP_DISCARD) {
         bio_endio(bio);
         return;
     }
 
-    // начальный сектор + количество секторов = контроль границ
+    /* 2. Глобальная проверка границ */
     if (unlikely(bio->bi_iter.bi_sector + bio_sectors(bio) > dev->num_sectors)) {
         bio->bi_status = BLK_STS_IOERR;
         bio_endio(bio);
@@ -73,91 +79,46 @@ static void simple_blkdev_submit_bio(struct bio *bio)
         return;
     }
 
-    // обнулить диапазон
+    /* 3. Обнуление диапазона (mkfs.ext4 активно использует эту команду) */
     if (op == REQ_OP_WRITE_ZEROES) {
-        sector_t sector = bio->bi_iter.bi_sector;
-        unsigned int nr_sectors = bio_sectors(bio);
-        loff_t pos = sector * SECTOR_SIZE;
-        size_t len = nr_sectors * SECTOR_SIZE;
-        size_t offset = 0;
+        loff_t pos = bio->bi_iter.bi_sector * SECTOR_SIZE;
+        size_t len = bio_sectors(bio) * SECTOR_SIZE;
 
         write_lock_irqsave(&dev->lock, flags);
-        while (offset < len) {
-            pgoff_t page_idx = (pos + offset) / PAGE_SIZE;
-            size_t page_off  = (pos + offset) % PAGE_SIZE;
-            size_t chunk_len = min_t(size_t, len - offset, PAGE_SIZE - page_off);
-
-            size_t chunk_n = page_idx / PAGES_PER_CHUNK;
-            size_t page_n = page_idx % PAGES_PER_CHUNK;
-
-            struct page *c_page = dev->chunks[chunk_n][page_n];
-            void *dst = kmap_local_page(c_page) + page_off;
-
-            memset(dst, 0, chunk_len);
-
-            kunmap_local(dst);
-            offset += chunk_len;
-        }
+        memset(dev->data + pos, 0, len);
         write_unlock_irqrestore(&dev->lock, flags);
 
         bio_endio(bio);
         return;
     }
 
+    /* 4. Обычное чтение/запись */
     bool is_write = (bio_data_dir(bio) == WRITE);
 
-    if (is_write)
-        write_lock_irqsave(&dev->lock, flags);
-    else
-        read_lock_irqsave(&dev->lock, flags);
-
     bio_for_each_segment(bvec, bio, iter) {
-        void *bvec_src = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
-        size_t need_len = bvec.bv_len;
-        size_t completed = 0;
-
-        /* Вычисляем глобальную позицию в байтах для текущего сегмента */
+        /* kmap_local_page для источника (bvec.bv_page) */
+        void *src = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
+        size_t len = bvec.bv_len;
         loff_t pos = iter.bi_sector * SECTOR_SIZE;
+        void *dst = dev->data + pos;
 
-        while (completed < need_len) {
-            /* Пересчитываем индексы на каждом шагу с учетом смещения completed */
-            pgoff_t page_idx = (pos + completed) / PAGE_SIZE;
-            size_t page_off  = (pos + completed) % PAGE_SIZE;
-
-            /* Защита от выхода за границы внутри сегмента */
-            if (unlikely(page_idx >= dev->num_pages)) {
-                bio->bi_status = BLK_STS_IOERR;
-                break;
-            }
-            // номер чанка
-            size_t chunk_n = page_idx / PAGES_PER_CHUNK;
-            // позиция указателя на страницу в чанке
-            size_t page_n = page_idx % PAGES_PER_CHUNK;
-            // длина: не больше остатка сегмента и не дальше конца текущей страницы
-            size_t chunk_len = min_t(size_t, need_len - completed, PAGE_SIZE - page_off);
-            
-            struct page *c_page = dev->chunks[chunk_n][page_n];
-            // указатель на память из struct page*
-            void *dst = kmap_local_page(c_page) + page_off;
-        
-            if (is_write)
-                memcpy(dst, bvec_src + completed, chunk_len);
-            else
-                memcpy(bvec_src + completed, dst, chunk_len);
-
-            kunmap_local(dst);
-
-            completed += chunk_len;
-            total_bytes_processed += chunk_len;
+        if (is_write) {
+            write_lock_irqsave(&dev->lock, flags);
+            memcpy(dst, src, len);
+            write_unlock_irqrestore(&dev->lock, flags);
+        } else {
+            read_lock_irqsave(&dev->lock, flags);
+            memcpy(src, dst, len);
+            read_unlock_irqrestore(&dev->lock, flags);
         }
-        kunmap_local(bvec_src);
+
+        kunmap_local(src);
+        total_bytes_processed += len;
     }
 
     if (is_write) {
-        write_unlock_irqrestore(&dev->lock, flags);
         atomic64_add(total_bytes_processed, &dev->bytes_written);
     } else {
-        read_unlock_irqrestore(&dev->lock, flags);
         atomic64_add(total_bytes_processed, &dev->bytes_read);
     }
 
@@ -172,14 +133,15 @@ static const struct block_device_operations simple_blkdev_fops = {
 };
 
 /* ------------------------------------------------------------------ */
-/* РЕАЛИЗАЦИЯ ИНТЕРФЕЙСА SYSFS                                        */
+/* ИНТЕРФЕЙС SYSFS                                                    */
 /* ------------------------------------------------------------------ */
+
 static ssize_t stat_bytes_read_show(struct device *dev,
                                     struct device_attribute *attr, char *buf)
 {
     struct gendisk *disk = dev_to_disk(dev);
     struct simple_blkdev_dev *sdev = disk->private_data;
-    return sysfs_emit(buf, "%lld\n", atomic64_read(&sdev->bytes_read));
+    return sysfs_emit(buf, "%lld\n", (long long)atomic64_read(&sdev->bytes_read));
 }
 
 static ssize_t stat_bytes_written_show(struct device *dev,
@@ -187,7 +149,7 @@ static ssize_t stat_bytes_written_show(struct device *dev,
 {
     struct gendisk *disk = dev_to_disk(dev);
     struct simple_blkdev_dev *sdev = disk->private_data;
-    return sysfs_emit(buf, "%lld\n", atomic64_read(&sdev->bytes_written));
+    return sysfs_emit(buf, "%lld\n", (long long)atomic64_read(&sdev->bytes_written));
 }
 
 static DEVICE_ATTR_RO(stat_bytes_read);
@@ -199,46 +161,20 @@ static struct attribute *simple_blkdev_attrs[] = {
     NULL,
 };
 
-// для sysfs_create_group
 static const struct attribute_group simple_blkdev_attr_group = {
     .attrs = simple_blkdev_attrs,
 };
 
 /* ------------------------------------------------------------------ */
 
-static void simple_blkdev_free_all(void)
-{
-    size_t i, j;
-
-    if (!simple_blkdev.chunks)
-        return;
-
-    for (i = 0; i < simple_blkdev.num_chunks; i++) {
-        if (!simple_blkdev.chunks[i])
-            continue;
-
-        size_t pages_in_chunk = min_t(size_t, PAGES_PER_CHUNK,
-                              simple_blkdev.num_pages - i * PAGES_PER_CHUNK);
-
-        for (j = 0; j < pages_in_chunk; j++) {
-            if (simple_blkdev.chunks[i][j])
-                __free_page(simple_blkdev.chunks[i][j]);
-        }
-        kfree(simple_blkdev.chunks[i]);
-    }
-    kfree(simple_blkdev.chunks);
-    simple_blkdev.chunks = NULL;
-}
-
 static int __init simple_blkdev_init(void)
 {
     int ret;
-    size_t i, j;
     struct queue_limits lim = {
         .logical_block_size  = SECTOR_SIZE,
         .physical_block_size = SECTOR_SIZE,
-        .max_segment_size    = PAGE_SIZE,// bv_offset + bv_len ≤ PAGE_SIZE
-        .max_sectors         = BLK_SAFE_MAX_SECTORS,//1.25 MiB
+        .max_segment_size    = PAGE_SIZE,
+        .max_sectors         = BLK_SAFE_MAX_SECTORS,
     };
 
     if (!simple_blkdev_size_mb) {
@@ -249,46 +185,15 @@ static int __init simple_blkdev_init(void)
     atomic64_set(&simple_blkdev.bytes_read, 0);
     atomic64_set(&simple_blkdev.bytes_written, 0);
 
-    simple_blkdev.size       = (size_t)simple_blkdev_size_mb * SZ_1M;// 300 MiB - размер диска
-    simple_blkdev.num_pages  = simple_blkdev.size / PAGE_SIZE;// 300 × 1024 × 1024 / 4096 = 76800 страниц
-    simple_blkdev.num_chunks = DIV_ROUND_UP(simple_blkdev.num_pages, PAGES_PER_CHUNK);// 76800 / 512 = 150
-    simple_blkdev.num_sectors = simple_blkdev.size / SECTOR_SIZE;// 300 × 1024 × 1024 / 512 = 614400 секторов
+    simple_blkdev.size        = (size_t)simple_blkdev_size_mb * SZ_1M;
+    simple_blkdev.num_sectors = simple_blkdev.size / SECTOR_SIZE;
 
-    pr_info("allocating static %u MiB: %zu pages in %zu chunks\n",
-            simple_blkdev_size_mb,
-            simple_blkdev.num_pages,
-            simple_blkdev.num_chunks);
+    pr_info("allocating %u MiB via vmalloc\n", simple_blkdev_size_mb);
 
-    simple_blkdev.chunks = kcalloc(simple_blkdev.num_chunks,
-                                   sizeof(struct page **),
-                                   GFP_KERNEL);
-    if (!simple_blkdev.chunks) {
-        pr_err("failed to allocate chunks array\n");
+    simple_blkdev.data = vzalloc(simple_blkdev.size);
+    if (!simple_blkdev.data) {
+        pr_err("failed to allocate %zu bytes via vmalloc\n", simple_blkdev.size);
         return -ENOMEM;
-    }
-
-    for (i = 0; i < simple_blkdev.num_chunks; i++) {
-        size_t pages_in_chunk = min_t(size_t, PAGES_PER_CHUNK, simple_blkdev.num_pages - i * PAGES_PER_CHUNK);
-
-        simple_blkdev.chunks[i] = kcalloc(pages_in_chunk,
-                                          sizeof(struct page *),
-                                          GFP_KERNEL);
-        if (!simple_blkdev.chunks[i]) {
-            ret = -ENOMEM;
-            pr_err("failed to allocate chunk[%zu]\n", i);
-            goto err_free;
-        }
-
-        for (j = 0; j < pages_in_chunk; j++) {
-            // 4096 байт (одна страница)
-            // запись остаётся в page table навсегда без выгрузки в swap
-            simple_blkdev.chunks[i][j] = alloc_page(GFP_KERNEL | __GFP_ZERO);
-            if (!simple_blkdev.chunks[i][j]) {
-                pr_err("failed to allocate page[%zu][%zu]\n", i, j);
-                ret = -ENOMEM;
-                goto err_free;
-            }
-        }
     }
 
     rwlock_init(&simple_blkdev.lock);
@@ -296,7 +201,7 @@ static int __init simple_blkdev_init(void)
     ret = register_blkdev(0, SIMPLE_BLKDEV_NAME);
     if (ret < 0) {
         pr_err("register_blkdev failed: %d\n", ret);
-        goto err_free;
+        goto err_vfree;
     }
     simple_blkdev_major = ret;
 
@@ -311,14 +216,12 @@ static int __init simple_blkdev_init(void)
     simple_blkdev.disk->minors       = SIMPLE_BLKDEV_MINORS;
     simple_blkdev.disk->fops         = &simple_blkdev_fops;
     simple_blkdev.disk->private_data = &simple_blkdev;
-    //simple_blkdev.disk->flags инициализируется по умолчанию
 
     snprintf(simple_blkdev.disk->disk_name,
              sizeof(simple_blkdev.disk->disk_name),
              "%s%d", SIMPLE_BLKDEV_NAME, SIMPLE_BLKDEV_FIRST_DISK_INDEX);
 
-    // размера блочного устройства в секторах
-    set_capacity(simple_blkdev.disk, simple_blkdev.size / SECTOR_SIZE);
+    set_capacity(simple_blkdev.disk, simple_blkdev.num_sectors);
 
     ret = add_disk(simple_blkdev.disk);
     if (ret) {
@@ -326,7 +229,6 @@ static int __init simple_blkdev_init(void)
         goto err_cleanup_disk;
     }
 
-    // disk_to_dev - возвращает device для "нулевого раздела" (весь диск)
     ret = sysfs_create_group(&disk_to_dev(simple_blkdev.disk)->kobj,
                              &simple_blkdev_attr_group);
     if (ret) {
@@ -338,18 +240,13 @@ static int __init simple_blkdev_init(void)
     return 0;
 
 err_del_disk:
-    // удаляет блочное устройство из системы — убирает его из /sys/block/, 
-    // не освобождает память
     del_gendisk(simple_blkdev.disk);
 err_cleanup_disk:
-    // уменьшает счётчик ссылок на struct gendisk и, если счётчик достигает нуля, 
-    // освобождает память, занятую диском
     put_disk(simple_blkdev.disk);
 err_unregister:
-    // освобождение major номера
     unregister_blkdev(simple_blkdev_major, SIMPLE_BLKDEV_NAME);
-err_free:
-    simple_blkdev_free_all();
+err_vfree:
+    vfree(simple_blkdev.data);
     return ret;
 }
 
@@ -357,10 +254,12 @@ static void __exit simple_blkdev_exit(void)
 {
     sysfs_remove_group(&disk_to_dev(simple_blkdev.disk)->kobj,
                        &simple_blkdev_attr_group);
+    /* Исключаем диск из видимости ядра */
     del_gendisk(simple_blkdev.disk);
+    /* Освобождаем ресурсы структуры gendisk */
     put_disk(simple_blkdev.disk);
     unregister_blkdev(simple_blkdev_major, SIMPLE_BLKDEV_NAME);
-    simple_blkdev_free_all();
+    vfree(simple_blkdev.data);
     pr_info("unloaded\n");
 }
 
@@ -368,5 +267,5 @@ module_init(simple_blkdev_init);
 module_exit(simple_blkdev_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("konygin");
-MODULE_DESCRIPTION("RAM block device 300 MiB with atomic64 stats and without reclaim");
+MODULE_AUTHOR("Konygin");
+MODULE_DESCRIPTION("RAM block device 300 MiB via vmalloc with atomic64 stats");
